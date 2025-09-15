@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from typing import cast
+from jose import ExpiredSignatureError, JWTError
 
 from fastapi import APIRouter, Depends, status, HTTPException
 from fastapi.security import OAuth2PasswordBearer
@@ -16,7 +17,7 @@ from database import (
     UserGroupEnum,
     ActivationTokenModel,
     PasswordResetTokenModel,
-    RefreshTokenModel
+    RefreshTokenModel,
 )
 from exceptions import BaseSecurityError
 from security.interfaces import JWTAuthManagerInterface
@@ -24,10 +25,14 @@ from schemas.accounts import (
     UserRegistrationResponseSchema,
     UserRegistrationRequestSchema,
     UserActivationRequestSchema,
-    MessageResponseSchema
-)
+    MessageResponseSchema,
+    UserLoginResponseSchema,
+    UserLoginRequestSchema,
+    TokenRefreshResponseSchema,
+    TokenRefreshRequestSchema
+    )
 
-from security.passwords import hash_password
+from security.passwords import hash_password, verify_password
 
 
 router = APIRouter()
@@ -64,8 +69,7 @@ async def register_user(user_data: UserRegistrationRequestSchema, db: AsyncSessi
 
 @router.post("/activate/",
              response_model = MessageResponseSchema,
-             status_code=201,
-             summary="activate user account")
+             status_code=status.HTTP_200_OK)
 
 async def activate_user(user_data: UserActivationRequestSchema, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
@@ -92,3 +96,72 @@ async def activate_user(user_data: UserActivationRequestSchema, db: AsyncSession
     return {"message": "User account activated successfully."}
 
 
+@router.post("/login/",
+             response_model=UserLoginResponseSchema,
+             status_code=status.HTTP_200_OK
+             )
+async def login_user(
+        login_data: UserLoginRequestSchema,
+        db: AsyncSession = Depends(get_db),
+        jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+        settings: BaseAppSettings = Depends(get_settings)
+        ):
+    result = await db.execute(
+        select(UserModel).where(
+            UserModel.email == login_data.email))
+    user = result.scalars().first()
+    if not user or not user.verify_password(login_data.password):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User account is not activated.")
+
+    access_token = jwt_manager.create_access_token({"sub": str(user.id)})
+    refresh_token = jwt_manager.create_refresh_token({"sub": str(user.id)})
+
+    try:
+        new_refresh_token = RefreshTokenModel(user=user.id, token=refresh_token)
+        db.add(new_refresh_token)
+        await db.commit()
+
+    except:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="An error occurred while processing the request.")
+
+    return UserLoginResponseSchema(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type="bearer"
+    )
+
+@router.post("/api/v1/accounts/refresh/",
+             response_model=TokenRefreshResponseSchema,
+             status_code=status.HTTP_200_OK)
+
+async def refresh_token(
+    refresh_data = TokenRefreshRequestSchema,
+    db: AsyncSession = Depends(get_db),
+    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+    settings: BaseAppSettings = Depends(get_settings)):
+    result = await db.execute(select(RefreshTokenModel).where(
+        RefreshTokenModel.token == refresh_data.refresh_token
+    ))
+    token_obj = result.scalars().first()
+    if not token_obj:
+        raise HTTPException(status_code=401, detail="Refresh token not found.")
+
+    try:
+        validated_data = jwt_manager.decode_refresh_token(token_obj.token)
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Token has expired.")
+    except InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid token.")
+
+    user_id = validated_data.get("sub")
+    result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    access_token = jwt_manager.create_access_token(data={"sub": str(user.id)})
+
+    return TokenRefreshResponseSchema(access_token=access_token)
